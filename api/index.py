@@ -1,59 +1,35 @@
-# Impor pustaka yang diperlukan di bagian atas
 import os
+import psycopg2
 from dotenv import load_dotenv
 
-# Panggil fungsi ini untuk memuat variabel dari file .env (hanya untuk lokal)
 load_dotenv()
 
 from flask import Flask, render_template, request, redirect, url_for, session, flash
 from flask_bcrypt import Bcrypt
-import json
 import random
 import string
 import smtplib
 
-# --- Perbaikan Path untuk Vercel ---
-# Tentukan path absolut ke direktori root proyek
-# Ini akan membantu Flask menemukan folder 'templates' dengan benar
+# --- Path dan Inisialisasi Aplikasi ---
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Inisialisasi Aplikasi Flask dengan path template yang benar
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, 'templates'))
 
-
-# --- Konfigurasi Keamanan Menggunakan Environment Variables ---
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'kunci-rahasia-default-lokal')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY')
 SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
 SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
+DATABASE_URL = os.environ.get('POSTGRES_URL') 
 
-# --- Sisa kode Anda ---
 bcrypt = Bcrypt(app)
-
-# Path untuk file users.json, relatif terhadap root proyek
-USER_FILE = os.path.join(BASE_DIR, 'users.json')
-# Di Vercel, kita hanya bisa menulis ke direktori /tmp
-TMP_USER_FILE = '/tmp/users.json'
-
-
 SMTP_SERVER = 'smtp.gmail.com'
 SMTP_PORT = 587
 
-def load_users():
-    """Memuat pengguna dari /tmp jika ada, jika tidak dari file asli (hanya saat pertama kali)."""
-    if os.path.exists(TMP_USER_FILE):
-        with open(TMP_USER_FILE, 'r') as f:
-            return json.load(f)
-    elif os.path.exists(USER_FILE):
-         with open(USER_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+# --- Fungsi Database ---
+def get_db_connection():
+    """Membuat koneksi ke database."""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
 
-
-def save_users(users):
-    """Menyimpan data pengguna ke direktori /tmp yang bisa ditulis di Vercel."""
-    with open(TMP_USER_FILE, 'w') as f:
-        json.dump(users, f, indent=4)
-
+# --- Fungsi Pengiriman Email ---
 def generate_otp(length=6):
     return ''.join(random.choices(string.digits, k=length))
 
@@ -65,11 +41,9 @@ def send_otp_email(recipient_email, otp):
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
-        
         subject = 'Kode OTP Anda'
         body = f'Ini adalah kode OTP Anda: {otp}\nJangan bagikan kode ini kepada siapa pun.'
         message = f'Subject: {subject}\n\n{body}'
-        
         server.sendmail(SENDER_EMAIL, recipient_email, message)
         server.quit()
         return True
@@ -77,8 +51,7 @@ def send_otp_email(recipient_email, otp):
         print(f"Gagal mengirim email: {e}")
         return False
 
-# --- Rute Aplikasi (tetap sama) ---
-
+# --- Rute Aplikasi ---
 @app.route('/')
 def index():
     return redirect(url_for('login'))
@@ -86,45 +59,54 @@ def index():
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form['username']
+        email = request.form['username']
         password = request.form['password']
-        
-        users = load_users()
-
-        if username in users:
-            flash('Username sudah ada. Silakan pilih yang lain.', 'danger')
-            return redirect(url_for('register'))
-
         hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
-        
-        users[username] = {'password': hashed_password}
-        save_users(users)
-        
-        flash('Registrasi berhasil! Silakan login.', 'success')
-        return redirect(url_for('login'))
-        
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO users (email, password_hash) VALUES (%s, %s)",
+                (email, hashed_password)
+            )
+            conn.commit()
+            flash('Registrasi berhasil! Silakan login.', 'success')
+            return redirect(url_for('login'))
+        except psycopg2.IntegrityError:
+            # Error ini terjadi jika email sudah ada (karena constraint UNIQUE)
+            flash('Email sudah terdaftar. Silakan gunakan email lain.', 'danger')
+            return redirect(url_for('register'))
+        finally:
+            cur.close()
+            conn.close()
+            
     return render_template('register.html')
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
+        email = request.form['username']
         password = request.form['password']
         
-        users = load_users()
-        user_data = users.get(username)
-
-        if user_data and bcrypt.check_password_hash(user_data['password'], password):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
+        user_record = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        if user_record and bcrypt.check_password_hash(user_record[0], password):
             otp = generate_otp()
-            if send_otp_email(username, otp):
+            if send_otp_email(email, otp):
                 session['otp'] = otp
-                session['otp_user'] = username
+                session['otp_user'] = email
                 flash('Login berhasil. Kode OTP telah dikirim ke email Anda.', 'info')
                 return redirect(url_for('verify_otp'))
             else:
                 flash('Gagal mengirim kode OTP. Silakan coba lagi.', 'danger')
         else:
-            flash('Login gagal. Periksa kembali username dan password Anda.', 'danger')
+            flash('Login gagal. Periksa kembali email dan password Anda.', 'danger')
             
     return render_template('login.html')
 
@@ -160,13 +142,18 @@ def change_password():
 
     if request.method == 'POST':
         new_password = request.form['new_password']
-        username = session['username']
-        
-        users = load_users()
         hashed_password = bcrypt.generate_password_hash(new_password).decode('utf-8')
+        email = session['username']
         
-        users[username]['password'] = hashed_password
-        save_users(users)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET password_hash = %s WHERE email = %s",
+            (hashed_password, email)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
         
         flash('Password berhasil diubah!', 'success')
         return redirect(url_for('dashboard'))
@@ -178,4 +165,3 @@ def logout():
     session.clear()
     flash('Anda telah berhasil logout.', 'info')
     return redirect(url_for('login'))
-
